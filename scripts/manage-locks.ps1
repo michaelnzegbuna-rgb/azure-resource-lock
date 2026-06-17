@@ -1,77 +1,93 @@
-# manage-locks.ps1
-# Script to automate creation, listing, and deletion of Azure Resource Locks.
+# lock-controller.ps1
+# Handles creating, listing, and removing Azure Resource Locks for the learning environment.
 
 param (
     [Parameter(Mandatory=$true)]
     [ValidateSet("Create", "List", "Remove")]
-    [string]$Action,
-
+    [string]$Operation,
     [Parameter(Mandatory=$false)]
     [ValidateSet("ResourceLevel", "GroupLevel")]
-    [string]$Level = "ResourceLevel",
-
+    [string]$Scope = "ResourceLevel",
     [Parameter(Mandatory=$false)]
-    [string]$LockType = "CanNotDelete"
+    [string]$LockKind = "CanNotDelete"
 )
 
-# Load configuration
-$configPath = Join-Path $PSScriptRoot "infra-config.json"
-if (-not (Test-Path $configPath)) {
-    Write-Error "Infrastructure configuration file not found at $configPath. Please run deploy-infra.ps1 first."
+# Pull in the infrastructure details produced by the provisioning script
+$settingsPath = Join-Path $PSScriptRoot "infra-config.json"
+if (-not (Test-Path $settingsPath)) {
+    Write-Error "Could not find $settingsPath. Run provision-environment.ps1 before this script."
     exit 1
 }
-$config = Get-Content $configPath -Raw | ConvertFrom-Json
-$rgName = $config.ResourceGroupName
-$saName = $config.StorageAccountName
-$nsgName = $config.NsgName
-$vmName = $config.VmName
 
-Write-Host "Action: $Action" -ForegroundColor Cyan
-Write-Host "Resource Group: $rgName" -ForegroundColor Cyan
+$settings        = Get-Content $settingsPath -Raw | ConvertFrom-Json
+$resourceGroup   = $settings.ResourceGroupName
+$storageAccount  = $settings.StorageAccountName
+$networkSecGroup = $settings.NsgName
+$virtualMachine  = $settings.VmName
 
-if ($Action -eq "Create") {
-    if ($Level -eq "ResourceLevel") {
-        Write-Host "Creating CanNotDelete lock on Storage Account: $saName..." -ForegroundColor Cyan
-        $saLock = az lock create --name "lock-sa-delete" --lock-type CanNotDelete --resource-group $rgName --resource-name $saName --resource-type "Microsoft.Storage/storageAccounts" | ConvertFrom-Json
-        
-        Write-Host "Creating ReadOnly lock on Network Security Group: $nsgName..." -ForegroundColor Cyan
-        $nsgLock = az lock create --name "lock-nsg-readonly" --lock-type ReadOnly --resource-group $rgName --resource-name $nsgName --resource-type "Microsoft.Network/networkSecurityGroups" | ConvertFrom-Json
-        
-        Write-Host "Locks successfully applied." -ForegroundColor Green
-    } else {
-        Write-Host "Creating $LockType lock at Resource Group level: $rgName..." -ForegroundColor Cyan
-        $rgLock = az lock create --name "lock-rg-level" --lock-type $LockType --resource-group $rgName | ConvertFrom-Json
-        Write-Host "Resource Group lock successfully applied." -ForegroundColor Green
+Write-Host "Operation: $Operation" -ForegroundColor Cyan
+Write-Host "Target Resource Group: $resourceGroup" -ForegroundColor Cyan
+
+switch ($Operation) {
+
+    "Create" {
+        if ($Scope -eq "ResourceLevel") {
+            Write-Host "Applying CanNotDelete lock to storage account '$storageAccount'..." -ForegroundColor Cyan
+            $storageLockResult = az lock create `
+                --name "lock-sa-delete" `
+                --lock-type CanNotDelete `
+                --resource-group $resourceGroup `
+                --resource-name $storageAccount `
+                --resource-type "Microsoft.Storage/storageAccounts" | ConvertFrom-Json
+
+            Write-Host "Applying ReadOnly lock to network security group '$networkSecGroup'..." -ForegroundColor Cyan
+            $nsgLockResult = az lock create `
+                --name "lock-nsg-readonly" `
+                --lock-type ReadOnly `
+                --resource-group $resourceGroup `
+                --resource-name $networkSecGroup `
+                --resource-type "Microsoft.Network/networkSecurityGroups" | ConvertFrom-Json
+
+            Write-Host "Resource-level locks applied." -ForegroundColor Green
+        }
+        else {
+            Write-Host "Applying $LockKind lock at the resource group level ('$resourceGroup')..." -ForegroundColor Cyan
+            $groupLockResult = az lock create `
+                --name "lock-rg-level" `
+                --lock-type $LockKind `
+                --resource-group $resourceGroup | ConvertFrom-Json
+
+            Write-Host "Group-level lock applied." -ForegroundColor Green
+        }
     }
-}
-elseif ($Action -eq "List") {
-    Write-Host "Listing locks in Resource Group $rgName..." -ForegroundColor Cyan
-    az lock list --resource-group $rgName -o table
-}
-elseif ($Action -eq "Remove") {
-    if ($Level -eq "ResourceLevel") {
-        Write-Host "Removing resource-level locks..." -ForegroundColor Cyan
-        $locks = az lock list --resource-group $rgName | ConvertFrom-Json
-        $count = 0
-        foreach ($lock in $locks) {
-            if ($lock.name -eq "lock-sa-delete" -or $lock.name -eq "lock-nsg-readonly") {
-                Write-Host "Deleting lock: $($lock.name) ($($lock.id))" -ForegroundColor Yellow
-                az lock delete --ids $lock.id
-                $count++
+
+    "List" {
+        Write-Host "Fetching locks for resource group '$resourceGroup'..." -ForegroundColor Cyan
+        az lock list --resource-group $resourceGroup -o table
+    }
+
+    "Remove" {
+        $existingLocks = az lock list --resource-group $resourceGroup | ConvertFrom-Json
+        $removedCount  = 0
+
+        if ($Scope -eq "ResourceLevel") {
+            Write-Host "Removing resource-level locks..." -ForegroundColor Cyan
+            $namesToRemove = @("lock-sa-delete", "lock-nsg-readonly")
+        }
+        else {
+            Write-Host "Removing group-level locks..." -ForegroundColor Cyan
+            $namesToRemove = @("lock-rg-level")
+        }
+
+        foreach ($lockItem in $existingLocks) {
+            if ($namesToRemove -contains $lockItem.name) {
+                Write-Host "Deleting lock '$($lockItem.name)' ($($lockItem.id))" -ForegroundColor Yellow
+                az lock delete --ids $lockItem.id
+                $removedCount++
             }
         }
-        Write-Host "Removed $count resource-level locks." -ForegroundColor Green
-    } else {
-        Write-Host "Removing group-level locks..." -ForegroundColor Cyan
-        $locks = az lock list --resource-group $rgName | ConvertFrom-Json
-        $count = 0
-        foreach ($lock in $locks) {
-            if ($lock.name -eq "lock-rg-level") {
-                Write-Host "Deleting lock: $($lock.name) ($($lock.id))" -ForegroundColor Yellow
-                az lock delete --ids $lock.id
-                $count++
-            }
-        }
-        Write-Host "Removed $count group-level locks." -ForegroundColor Green
+
+        $scopeLabel = if ($Scope -eq "ResourceLevel") { "resource-level" } else { "group-level" }
+        Write-Host "Removed $removedCount $scopeLabel lock(s)." -ForegroundColor Green
     }
 }
